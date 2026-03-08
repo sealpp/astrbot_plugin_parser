@@ -1,5 +1,3 @@
-import json
-from importlib.util import find_spec
 from itertools import chain
 from pathlib import Path
 
@@ -33,11 +31,6 @@ from .exception import (
     ZeroSizeException,
 )
 from .render import Renderer
-
-if find_spec("aiocqhttp.exceptions"):
-    from aiocqhttp.exceptions import ActionFailed as AiocqhttpActionFailed
-else:
-    AiocqhttpActionFailed = None
 
 
 class MessageSender:
@@ -103,7 +96,6 @@ class MessageSender:
             "force_merge": force_merge,
         }
 
-
     async def _send_preview_card(
         self,
         event: AstrMessageEvent,
@@ -123,7 +115,6 @@ class MessageSender:
 
         if image_path := await self.renderer.render_card(result):
             await event.send(event.chain_result([Image(self._to_file_uri(image_path))]))
-
 
     async def _build_segments(
         self,
@@ -193,7 +184,6 @@ class MessageSender:
 
         return segs
 
-
     def _merge_segments_if_needed(
         self,
         event: AstrMessageEvent,
@@ -234,16 +224,6 @@ class MessageSender:
 
         return meta
 
-    @staticmethod
-    def _is_send_action_failed(exc: Exception) -> bool:
-        """兼容不同适配器发送异常类型。"""
-        if AiocqhttpActionFailed and isinstance(exc, AiocqhttpActionFailed):
-            return True
-
-        type_name = exc.__class__.__name__
-        return any(key in type_name for key in ("ActionFailed", "Send", "Adapter"))
-
-
     async def send_parse_result(
         self,
         event: AstrMessageEvent,
@@ -266,48 +246,12 @@ class MessageSender:
         segs = await self._build_segments(result, plan)
         segs = self._merge_segments_if_needed(event, segs, plan["force_merge"])
 
-        if segs:
-            try:
-                await event.send(event.chain_result(segs))
-            except Exception as e:
-                if not self._is_send_action_failed(e):
-                    # 发送链路外异常也兜底，避免影响插件主处理链
-                    logger.exception(
-                        f"发送解析结果出现非预期异常，将执行降级发送: {e}"
-                    )
+        if not segs:
+            logger.warning("发送结果为空，不执行发送")
+            return
 
-                session_id = getattr(event, "unified_msg_origin", "unknown")
-                seg_meta = self._collect_seg_meta(segs)
-                logger.error(
-                    "发送解析结果失败 | payload=%s",
-                    json.dumps(
-                        {
-                            "session_id": str(session_id),
-                            "segments": seg_meta,
-                            "error": str(e),
-                        },
-                        ensure_ascii=False,
-                    ),
-                )
-
-                try:
-                    await event.send(
-                        event.chain_result(
-                            [
-                                Plain(
-                                    "媒体发送失败，请检查适配器或平台配置"
-                                )
-                            ]
-                        )
-                    )
-                except Exception as fallback_e:
-                    logger.error(
-                        "降级消息发送失败 | payload=%s",
-                        json.dumps(
-                            {
-                                "session_id": str(session_id),
-                                "error": str(fallback_e),
-                            },
-                            ensure_ascii=False,
-                        ),
-                    )
+        try:
+            await event.send(event.chain_result(segs))
+        except Exception as e:
+            seg_meta = self._collect_seg_meta(segs)
+            logger.error(f"发送解析结果失败： error={e}, segments={seg_meta}")
