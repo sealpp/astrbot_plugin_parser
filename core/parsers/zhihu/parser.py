@@ -27,6 +27,17 @@ RequestContext = dict[str, str | int]
 
 class ZhihuParser(BaseParser):
     platform: ClassVar[Platform] = Platform(name="zhihu", display_name="知乎")
+    _CARD_SUMMARY_LIMIT: ClassVar[int] = 80
+    _CARD_SENTENCE_MARKERS: ClassVar[tuple[str, ...]] = (
+        "。",
+        "！",
+        "？",
+        "；",
+        "…",
+        "!",
+        "?",
+        ";",
+    )
     _MEDIA_ATTRS: ClassVar[tuple[str, ...]] = (
         "src",
         "data-src",
@@ -117,7 +128,12 @@ class ZhihuParser(BaseParser):
             initial_data,
             page_url=url,
         )
-        body_text = body_text or self._normalize_text(str(article.get("excerpt") or ""))
+        article_excerpt = str(article.get("excerpt") or "")
+        card_text = self._build_card_summary(
+            article_excerpt,
+            self._first_text_block(body_blocks),
+            body_text,
+        )
         ordered_blocks = self._build_section_blocks(None, body_blocks, body_text)
         stats = self._build_content_stats(
             article.get("voteupCount"),
@@ -126,8 +142,7 @@ class ZhihuParser(BaseParser):
             article.get("likedCount"),
             labels=("赞同", "评论", "收藏", "喜欢"),
         )
-        text = self._compose_article_text(article, author, body_text, stats)
-        header_text = self._compose_article_text(article, author, "", stats)
+        header_text = self._compose_article_send_header(article, author)
         contents, send_groups = self._build_contents_and_groups(
             header_text,
             ordered_blocks,
@@ -137,13 +152,13 @@ class ZhihuParser(BaseParser):
 
         return self.result(
             title=str(article.get("title") or "知乎文章"),
-            text=text or None,
+            text=card_text,
             author=author,
             timestamp=self._safe_int(article.get("created")),
             url=url,
             contents=contents,
             send_groups=send_groups,
-            extra={"info": self._format_stats_line(stats) if stats else None},
+            extra={"info": self._build_article_card_meta(article, stats)},
         )
 
     async def parse_answer(self, question_id: str, answer_id: str):
@@ -165,28 +180,17 @@ class ZhihuParser(BaseParser):
             raise ParseException("知乎问题数据不存在")
 
         author = self._build_author(answer.get("author"), headers=request_headers)
-        question_detail = ""
-        question_detail_blocks: list[BodyBlock] = []
-        question_detail_videos: list[VideoEntry] = []
-        if question_detail_html := str(question.get("detail") or "").strip():
-            (
-                question_detail,
-                question_detail_blocks,
-                question_detail_videos,
-            ) = await self._extract_content(
-                question_detail_html,
-                initial_data,
-                page_url=url,
-                include_state_videos=False,
-            )
-
         body_text, body_blocks, answer_videos = await self._extract_content(
             str(answer.get("content") or ""),
             initial_data,
             page_url=url,
         )
-        body_text = body_text or self._normalize_text(str(answer.get("excerpt") or ""))
-        question_stats = self._build_question_stats(question)
+        answer_excerpt = str(answer.get("excerpt") or "")
+        card_text = self._build_card_summary(
+            answer_excerpt,
+            self._first_text_block(body_blocks),
+            body_text,
+        )
         answer_stats = self._build_content_stats(
             answer.get("voteupCount"),
             answer.get("commentCount"),
@@ -194,54 +198,28 @@ class ZhihuParser(BaseParser):
             answer.get("thanksCount") or answer.get("likedCount"),
             labels=("赞同", "评论", "收藏", "喜欢"),
         )
-        text = self._compose_answer_text(
+        header_text = self._compose_answer_send_header(
             question=question,
-            question_detail=question_detail,
             author=author,
             answer=answer,
-            question_stats=question_stats,
-            answer_stats=answer_stats,
-            body_text=body_text,
         )
-        header_text = self._compose_answer_text(
-            question=question,
-            question_detail="",
-            author=author,
-            answer=answer,
-            question_stats=question_stats,
-            answer_stats=answer_stats,
-            body_text="",
-        )
-        ordered_blocks = self._build_section_blocks(
-            "问题描述:",
-            question_detail_blocks,
-            question_detail,
-        )
-        ordered_blocks.extend(
-            self._build_section_blocks("回答正文:", body_blocks, body_text)
-        )
-        video_entries = self._merge_unique_video_entries(
-            question_detail_videos,
-            answer_videos,
-        )
+        ordered_blocks = self._build_section_blocks("回答正文:", body_blocks, body_text)
         contents, send_groups = self._build_contents_and_groups(
             header_text,
             ordered_blocks,
-            video_entries,
+            answer_videos,
             request_headers=request_headers,
         )
 
         return self.result(
             title=str(question.get("title") or "知乎回答"),
-            text=text or None,
+            text=card_text,
             author=author,
             timestamp=self._safe_int(answer.get("createdTime")),
             url=url,
             contents=contents,
             send_groups=send_groups,
-            extra={
-                "info": self._format_stats_line(answer_stats) if answer_stats else None
-            },
+            extra={"info": self._build_answer_card_meta(answer_stats)},
         )
 
     async def parse_question(self, question_id: str):
@@ -268,72 +246,57 @@ class ZhihuParser(BaseParser):
         )
         author = self._build_author(answer.get("author"), headers=answer_headers)
 
+        question_detail_html = str(question.get("detail") or "").strip()
         detail_text = ""
-        detail_blocks: list[BodyBlock] = []
-        detail_videos: list[VideoEntry] = []
-        if question_detail_html := str(question.get("detail") or "").strip():
-            detail_text, detail_blocks, detail_videos = await self._extract_content(
+        if question_detail_html:
+            detail_text, _, _ = await self._extract_content(
                 question_detail_html,
                 initial_data,
                 page_url=url,
                 include_state_videos=False,
             )
 
+        answer_excerpt = str(answer.get("excerpt") or "")
         answer_text, answer_blocks, answer_videos = await self._extract_content(
             str(answer.get("content") or ""),
             answer_data,
             page_url=self._answer_url(question_id, answer_id),
         )
-        answer_text = answer_text or self._normalize_text(
-            str(answer.get("excerpt") or "")
-        )
+        answer_text = answer_text or self._normalize_text(answer_excerpt)
 
-        video_entries = self._merge_unique_video_entries(detail_videos, answer_videos)
         question_stats = self._build_question_stats(question)
-        text = self._compose_question_text(
-            question=question,
-            author=author,
-            answer=answer,
-            question_stats=question_stats,
-            detail_text=detail_text,
-            answer_text=answer_text,
+        card_text = self._build_card_summary(
+            question_detail_html,
+            answer_excerpt,
+            self._first_text_block(answer_blocks),
+            answer_text,
         )
-        header_text = self._compose_question_text(
+        header_text = self._compose_question_send_header(
             question=question,
             author=author,
             answer=answer,
-            question_stats=question_stats,
-            detail_text="",
-            answer_text="",
         )
         ordered_blocks = self._build_section_blocks(
-            "问题描述:",
-            detail_blocks,
-            detail_text,
-        )
-        ordered_blocks.extend(
-            self._build_section_blocks("默认排序首条回答:", answer_blocks, answer_text)
+            "默认排序首条回答:",
+            answer_blocks,
+            answer_text,
         )
         contents, send_groups = self._build_contents_and_groups(
             header_text,
             ordered_blocks,
-            video_entries,
+            answer_videos,
             request_headers=answer_headers,
         )
 
         return self.result(
             title=str(question.get("title") or "知乎问题"),
-            text=text or None,
+            text=card_text,
             author=author,
             timestamp=self._safe_int(answer.get("createdTime")),
             url=url,
             contents=contents,
             send_groups=send_groups,
-            extra={
-                "info": self._format_stats_line(question_stats)
-                if question_stats
-                else None
-            },
+            extra={"info": self._build_question_card_meta(question_stats)},
         )
 
     async def _fetch_initial_data(
@@ -633,6 +596,131 @@ class ZhihuParser(BaseParser):
                 stats.append((label, self._format_count(value)))
         return stats
 
+    def _build_article_card_meta(
+        self,
+        article: dict[str, Any],
+        stats: list[StatItem],
+    ) -> str | None:
+        tokens: list[str] = []
+        if column_title := self._truncate_card_token(
+            self._article_column_title(article),
+            limit=12,
+        ):
+            tokens.append(column_title)
+        for label in ("赞同", "评论", "收藏"):
+            if token := self._stat_token(stats, label):
+                tokens.append(token)
+        return self._build_card_meta("文章", *tokens, max_tokens=5)
+
+    def _build_answer_card_meta(self, stats: list[StatItem]) -> str | None:
+        tokens = [
+            token
+            for label in ("赞同", "评论", "收藏")
+            if (token := self._stat_token(stats, label))
+        ]
+        return self._build_card_meta("回答", *tokens, max_tokens=4)
+
+    def _build_question_card_meta(self, stats: list[StatItem]) -> str | None:
+        tokens = [
+            token
+            for label in ("回答", "关注", "浏览")
+            if (token := self._stat_token(stats, label))
+        ]
+        return self._build_card_meta("问题", *tokens, max_tokens=4)
+
+    def _build_card_summary(self, *sources: Any) -> str | None:
+        for source in sources:
+            summary = self._clean_card_summary_source(source)
+            if summary:
+                return self._truncate_card_summary(summary)
+        return None
+
+    def _clean_card_summary_source(self, source: Any) -> str:
+        if source is None:
+            return ""
+        value = str(source).strip()
+        if not value:
+            return ""
+        text = (
+            self._html_to_text(value)
+            if self._looks_like_html(value)
+            else self._normalize_text(value)
+        )
+        return self._normalize_text(
+            self._strip_card_prefix(text),
+            keep_newlines=False,
+        )
+
+    def _truncate_card_summary(self, text: str) -> str:
+        value = self._normalize_text(text, keep_newlines=False)
+        if len(value) <= self._CARD_SUMMARY_LIMIT:
+            return value
+
+        window = value[: self._CARD_SUMMARY_LIMIT + 1]
+        last_break = max(
+            (window.rfind(marker) for marker in self._CARD_SENTENCE_MARKERS),
+            default=-1,
+        )
+        if last_break >= max(18, self._CARD_SUMMARY_LIMIT // 2):
+            return window[: last_break + 1].strip()
+        return value[: self._CARD_SUMMARY_LIMIT].rstrip(" ，,；;。！？!?、") + "…"
+
+    def _build_card_meta(
+        self,
+        kind: str,
+        *tokens: str,
+        max_tokens: int,
+    ) -> str | None:
+        items = [kind, *(token for token in tokens if token)]
+        items = items[:max_tokens]
+        return " · ".join(items) if items else None
+
+    @staticmethod
+    def _looks_like_html(text: str) -> bool:
+        return bool(re.search(r"<[A-Za-z!/][^>]*>", text))
+
+    @staticmethod
+    def _strip_card_prefix(text: str) -> str:
+        value = text.strip()
+        for prefix in (
+            "问题描述:",
+            "回答正文:",
+            "默认排序首条回答:",
+            "专栏:",
+            "标题:",
+            "问题:",
+        ):
+            if value.startswith(prefix):
+                return value[len(prefix) :].strip()
+        return value
+
+    def _first_text_block(self, body_blocks: list[BodyBlock]) -> str | None:
+        for block in body_blocks:
+            if block.get("kind") != "text":
+                continue
+            value = self._clean_card_summary_source(block.get("value"))
+            if value:
+                return value
+        return None
+
+    @staticmethod
+    def _truncate_card_token(value: str | None, *, limit: int) -> str | None:
+        if not value:
+            return None
+        text = value.strip()
+        if not text:
+            return None
+        if len(text) <= limit:
+            return text
+        return text[:limit].rstrip() + "…"
+
+    @staticmethod
+    def _stat_token(stats: list[StatItem], label: str) -> str | None:
+        for current_label, value in stats:
+            if current_label == label and value:
+                return f"{label} {value}"
+        return None
+
     def _build_contents_and_groups(
         self,
         header_text: str,
@@ -694,17 +782,21 @@ class ZhihuParser(BaseParser):
 
         send_groups: list[SendGroup] = []
         if primary_contents:
-            send_groups.append(SendGroup(contents=primary_contents))
+            send_groups.append(
+                SendGroup(
+                    contents=primary_contents,
+                    force_merge=False,
+                    render_card=True,
+                )
+            )
         for video in video_contents:
             send_groups.append(SendGroup(contents=[video], force_merge=False))
         return contents, send_groups
 
-    def _compose_article_text(
+    def _compose_article_send_header(
         self,
         article: dict[str, Any],
         author: Any,
-        body_text: str,
-        stats: list[StatItem],
     ) -> str:
         sections: list[str] = []
         if title := self._normalize_text(str(article.get("title") or "")):
@@ -714,61 +806,36 @@ class ZhihuParser(BaseParser):
             sections.append(f"专栏: {column_title}")
         if created_text := self._format_timestamp(article.get("created")):
             sections.append(f"发布时间: {created_text}")
-        if stats:
-            sections.append(f"统计: {self._format_stats_line(stats)}")
-        if body_text:
-            sections.append(body_text)
         return self._join_sections(sections)
 
-    def _compose_answer_text(
+    def _compose_answer_send_header(
         self,
         *,
         question: dict[str, Any],
-        question_detail: str,
         author: Any,
         answer: dict[str, Any],
-        question_stats: list[StatItem],
-        answer_stats: list[StatItem],
-        body_text: str,
     ) -> str:
         sections: list[str] = []
         if title := self._normalize_text(str(question.get("title") or "")):
             sections.append(f"问题: {title}")
-        if question_stats:
-            sections.append(f"问题统计: {self._format_stats_line(question_stats)}")
-        if question_detail:
-            sections.append(f"问题描述:\n{question_detail}")
         sections.extend(self._author_sections(author, label="答主"))
         if created_text := self._format_timestamp(answer.get("createdTime")):
             sections.append(f"回答时间: {created_text}")
-        if answer_stats:
-            sections.append(f"回答统计: {self._format_stats_line(answer_stats)}")
-        if body_text:
-            sections.append(f"回答正文:\n{body_text}")
         return self._join_sections(sections)
 
-    def _compose_question_text(
+    def _compose_question_send_header(
         self,
         *,
         question: dict[str, Any],
         author: Any,
         answer: dict[str, Any],
-        question_stats: list[StatItem],
-        detail_text: str,
-        answer_text: str,
     ) -> str:
         sections: list[str] = []
         if title := self._normalize_text(str(question.get("title") or "")):
             sections.append(f"问题: {title}")
-        if question_stats:
-            sections.append(f"问题统计: {self._format_stats_line(question_stats)}")
-        if detail_text:
-            sections.append(f"问题描述:\n{detail_text}")
         sections.extend(self._author_sections(author, label="首条回答作者"))
         if created_text := self._format_timestamp(answer.get("createdTime")):
             sections.append(f"首条回答时间: {created_text}")
-        if answer_text:
-            sections.append(f"默认排序首条回答:\n{answer_text}")
         return self._join_sections(sections)
 
     def _author_sections(self, author: Any, *, label: str) -> list[str]:
@@ -776,8 +843,6 @@ class ZhihuParser(BaseParser):
         if author is None:
             return sections
         sections.append(f"{label}: {author.name}")
-        if author.description:
-            sections.append(f"{label}简介: {author.description}")
         return sections
 
     @staticmethod
