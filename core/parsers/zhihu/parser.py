@@ -112,6 +112,13 @@ class ZhihuParser(BaseParser):
     async def _parse_question(self, searched: re.Match[str]):
         return await self.parse_question(searched.group("question_id"))
 
+    @handle(
+        "www.zhihu.com/pin/",
+        r"www\.zhihu\.com/pin/(?P<pin_id>\d+)(?:[/?#][^\s]*)?",
+    )
+    async def _parse_pin(self, searched: re.Match[str]):
+        return await self.parse_pin(searched.group("pin_id"))
+
     async def parse_article(self, article_id: str):
         url = self._article_url(article_id)
         initial_data, request_headers = await self._fetch_initial_data(
@@ -299,6 +306,49 @@ class ZhihuParser(BaseParser):
             extra={"info": self._build_question_card_meta(question_stats)},
         )
 
+    async def parse_pin(self, pin_id: str):
+        url = self._pin_url(pin_id)
+        payload, request_headers = await self._fetch_json_data(
+            self._pin_api_url(pin_id),
+            validator=lambda data: self._has_pin_payload(data, pin_id),
+        )
+
+        author = self._build_author(payload.get("author"), headers=request_headers)
+        body_html = self._pin_content_html(payload)
+        body_text, body_blocks, video_entries = await self._extract_content(
+            body_html,
+            payload,
+            page_url=url,
+        )
+        body_text = body_text or self._pin_plain_text(payload)
+        card_title = (
+            self._build_card_summary(
+                body_html,
+                self._first_text_block(body_blocks),
+                body_text,
+            )
+            or "知乎想法"
+        )
+        header_text = self._compose_pin_send_header(payload, author)
+        ordered_blocks = self._build_section_blocks(None, body_blocks, body_text)
+        contents, send_groups = self._build_contents_and_groups(
+            header_text,
+            ordered_blocks,
+            video_entries,
+            request_headers=request_headers,
+        )
+
+        return self.result(
+            title=card_title,
+            text=None,
+            author=author,
+            timestamp=self._pin_timestamp(payload),
+            url=url,
+            contents=contents,
+            send_groups=send_groups,
+            extra={"info": self._build_pin_card_meta(payload)},
+        )
+
     async def _fetch_initial_data(
         self,
         url: str,
@@ -384,21 +434,141 @@ class ZhihuParser(BaseParser):
 
         raise ParseException("知乎页面抓取失败") from last_error
 
-    def _request_profiles(self, url: str) -> list[tuple[str, str, dict[str, str], str]]:
-        desktop_headers = self._build_request_headers(self.headers)
-        ios_headers = self._build_request_headers(self.ios_headers)
-        mobile_headers = self._build_request_headers(self.android_headers)
+    async def _fetch_json_data(
+        self,
+        url: str,
+        *,
+        validator: Callable[[dict[str, Any]], bool],
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        last_error: Exception | None = None
+        saw_challenge = False
+        saw_forbidden = False
+        saw_login = False
+        saw_invalid_target = False
+        saw_json_payload = False
+
+        for profile_name, profile_url, headers, impersonate in self._request_profiles(
+            url,
+            accept="application/json, text/plain, */*",
+        ):
+            try:
+                response_ctx = await self._request_text(
+                    profile_url,
+                    headers=headers,
+                    impersonate=impersonate,
+                )
+
+                body_text = str(response_ctx["text"])
+                final_url = str(response_ctx["final_url"])
+                status_code = int(response_ctx["status_code"])
+                content_type = str(response_ctx.get("content_type") or "")
+
+                if self._is_challenge_page(body_text, status_code=status_code):
+                    saw_challenge = True
+                    logger.debug(
+                        f"[知乎] {profile_name} 命中反爬挑战接口: {profile_url} -> {final_url}"
+                    )
+                    continue
+
+                if self._is_login_page(final_url, body_text):
+                    saw_login = True
+                    logger.debug(
+                        f"[知乎] {profile_name} 命中登录接口: {profile_url} -> {final_url}"
+                    )
+                    continue
+
+                if status_code in (401, 403):
+                    saw_forbidden = True
+                    logger.debug(
+                        f"[知乎] {profile_name} JSON 接口无权限: "
+                        f"{profile_url} -> {final_url}, status={status_code}"
+                    )
+                    continue
+
+                if status_code >= 400:
+                    saw_invalid_target = True
+                    logger.debug(
+                        f"[知乎] {profile_name} JSON 接口状态异常: "
+                        f"{profile_url} -> {final_url}, status={status_code}"
+                    )
+                    continue
+
+                payload = self._extract_json_payload(
+                    body_text,
+                    content_type=content_type,
+                )
+                if payload is None:
+                    logger.debug(
+                        f"[知乎] {profile_name} 未返回可解析 JSON: "
+                        f"{profile_url} -> {final_url}, content-type={content_type}"
+                    )
+                    continue
+
+                saw_json_payload = True
+                if validator(payload):
+                    logger.debug(
+                        f"[知乎] 使用 {profile_name} JSON 接口请求成功: "
+                        f"{profile_url} -> {final_url}"
+                    )
+                    return payload, headers
+
+                saw_invalid_target = True
+                logger.debug(
+                    f"[知乎] {profile_name} JSON 接口拿到的不是目标数据: "
+                    f"{profile_url} -> {final_url}, status={status_code}"
+                )
+            except Exception as exc:
+                last_error = exc
+                logger.debug(
+                    f"[知乎] {profile_name} JSON 接口请求失败: {profile_url}, error={exc}"
+                )
+
+        if saw_challenge or saw_forbidden:
+            if self.mycfg.cookies:
+                raise ParseException(
+                    "知乎抓取失败：当前 cookies 可能失效，或请求仍被风控拦截"
+                )
+            raise ParseException("知乎抓取失败：站点返回反爬挑战页，请配置有效 cookies")
+
+        if saw_login:
+            if self.mycfg.cookies:
+                raise ParseException("知乎抓取失败：当前 cookies 可能失效，或权限不足")
+            raise ParseException(
+                "知乎抓取失败：当前请求被引导到登录页，请配置有效 cookies"
+            )
+
+        if saw_invalid_target or saw_json_payload:
+            raise ParseException("知乎抓取失败：未拿到目标知乎数据")
+
+        raise ParseException("知乎接口请求失败") from last_error
+
+    def _request_profiles(
+        self,
+        url: str,
+        *,
+        accept: str | None = None,
+    ) -> list[tuple[str, str, dict[str, str], str]]:
+        desktop_headers = self._build_request_headers(self.headers, accept=accept)
+        ios_headers = self._build_request_headers(self.ios_headers, accept=accept)
+        mobile_headers = self._build_request_headers(
+            self.android_headers, accept=accept
+        )
         return [
             ("desktop", url, desktop_headers, "chrome"),
             ("ios", url, ios_headers, "safari_ios"),
             ("mobile", url, mobile_headers, "chrome_android"),
         ]
 
-    def _build_request_headers(self, base_headers: dict[str, str]) -> dict[str, str]:
+    def _build_request_headers(
+        self,
+        base_headers: dict[str, str],
+        *,
+        accept: str | None = None,
+    ) -> dict[str, str]:
         headers = dict(base_headers)
         headers.update(
             {
-                "accept": self.headers["accept"],
+                "accept": accept or self.headers["accept"],
                 "accept-language": self.headers["accept-language"],
                 "referer": self.headers["referer"],
                 "origin": self.headers["origin"],
@@ -434,7 +604,25 @@ class ZhihuParser(BaseParser):
             "status_code": int(response.status_code),
             "final_url": str(response.url),
             "text": str(response.text),
+            "content_type": str(response.headers.get("content-type", "")),
         }
+
+    @staticmethod
+    def _extract_json_payload(
+        raw_text: str,
+        *,
+        content_type: str,
+    ) -> dict[str, Any] | None:
+        text = raw_text.strip()
+        if not text:
+            return None
+        if "application/json" not in content_type.lower() and not text.startswith("{"):
+            return None
+        try:
+            payload = json.loads(text)
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
 
     def _extract_initial_data(self, html_text: str) -> dict[str, Any] | None:
         soup = BeautifulSoup(html_text, "html.parser")
@@ -482,6 +670,22 @@ class ZhihuParser(BaseParser):
         )
         return isinstance(question, dict) and bool(
             self._pick_first_answer_id(initial_data, question_id)
+        )
+
+    def _has_pin_payload(self, payload: dict[str, Any], pin_id: str) -> bool:
+        current_id = payload.get("id") or payload.get("pin_id") or payload.get("pinId")
+        if current_id is not None and str(current_id) == pin_id:
+            return True
+        return any(
+            payload.get(key) is not None
+            for key in (
+                "content_html",
+                "contentHtml",
+                "content",
+                "author",
+                "created_time",
+                "updated_time",
+            )
         )
 
     @staticmethod
@@ -554,7 +758,12 @@ class ZhihuParser(BaseParser):
         name = str(author_data.get("name") or "").strip()
         if not name:
             return None
-        avatar_url = str(author_data.get("avatarUrl") or "").strip() or None
+        avatar_url = (
+            str(
+                author_data.get("avatarUrl") or author_data.get("avatar_url") or ""
+            ).strip()
+            or None
+        )
         description = (
             self._normalize_text(
                 str(author_data.get("headline") or author_data.get("description") or "")
@@ -627,6 +836,19 @@ class ZhihuParser(BaseParser):
             if (token := self._stat_token(stats, label))
         ]
         return self._build_card_meta("问题", *tokens, max_tokens=4)
+
+    def _build_pin_card_meta(self, pin: dict[str, Any]) -> str | None:
+        tokens: list[str] = []
+        if voteup := self._pin_stat_token(pin, "赞同", "voteup_count", "voteupCount"):
+            tokens.append(voteup)
+        if comment := self._pin_stat_token(
+            pin,
+            "评论",
+            "comment_count",
+            "commentCount",
+        ):
+            tokens.append(comment)
+        return self._build_card_meta("想法", *tokens, max_tokens=3)
 
     def _build_card_summary(self, *sources: Any) -> str | None:
         for source in sources:
@@ -719,6 +941,19 @@ class ZhihuParser(BaseParser):
         for current_label, value in stats:
             if current_label == label and value:
                 return f"{label} {value}"
+        return None
+
+    def _pin_stat_token(
+        self,
+        pin: dict[str, Any],
+        label: str,
+        *keys: str,
+    ) -> str | None:
+        for key in keys:
+            value = pin.get(key)
+            if value is None:
+                continue
+            return f"{label} {self._format_count(value)}"
         return None
 
     def _build_contents_and_groups(
@@ -838,6 +1073,15 @@ class ZhihuParser(BaseParser):
             sections.append(f"首条回答时间: {created_text}")
         return self._join_sections(sections)
 
+    def _compose_pin_send_header(self, pin: dict[str, Any], author: Any) -> str:
+        sections: list[str] = []
+        sections.extend(self._author_sections(author, label="作者"))
+        if created_text := self._format_timestamp(
+            pin.get("created_time") or pin.get("updated_time")
+        ):
+            sections.append(f"发布时间: {created_text}")
+        return self._join_sections(sections)
+
     def _author_sections(self, author: Any, *, label: str) -> list[str]:
         sections: list[str] = []
         if author is None:
@@ -856,6 +1100,32 @@ class ZhihuParser(BaseParser):
             return None
         title = str(column.get("title") or "").strip()
         return title or None
+
+    @staticmethod
+    def _pin_content_html(pin: dict[str, Any]) -> str:
+        return str(pin.get("content_html") or pin.get("contentHtml") or "").strip()
+
+    def _pin_plain_text(self, pin: dict[str, Any]) -> str:
+        content = pin.get("content")
+        if isinstance(content, str):
+            return self._normalize_text(content, keep_newlines=True)
+        if content is None:
+            return ""
+        if isinstance(content, (dict, list)):
+            value = self._find_text_value(
+                content,
+                (
+                    "content",
+                    "text",
+                    "description",
+                    "title",
+                ),
+            )
+            return self._normalize_text(value or "", keep_newlines=True)
+        return self._normalize_text(str(content), keep_newlines=True)
+
+    def _pin_timestamp(self, pin: dict[str, Any]) -> int | None:
+        return self._safe_int(pin.get("created_time") or pin.get("updated_time"))
 
     async def _extract_content(
         self,
@@ -2071,6 +2341,17 @@ class ZhihuParser(BaseParser):
     @staticmethod
     def _article_url(article_id: str) -> str:
         return f"https://zhuanlan.zhihu.com/p/{article_id}"
+
+    @staticmethod
+    def _pin_url(pin_id: str) -> str:
+        return f"https://www.zhihu.com/pin/{pin_id}"
+
+    @staticmethod
+    def _pin_api_url(pin_id: str) -> str:
+        return (
+            "https://www.zhihu.com/api/v4/pins/"
+            f"{pin_id}?include=content,content_html,created_time,updated_time,author,origin_pin"
+        )
 
     @staticmethod
     def _answer_url(question_id: str, answer_id: str) -> str:
