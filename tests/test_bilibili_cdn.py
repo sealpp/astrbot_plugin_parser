@@ -76,16 +76,17 @@ class BilibiliCDNTests(unittest.IsolatedAsyncioTestCase):
             video_codecs="avc1",
         )
 
-    async def extract(self, parser, streams, data=None):
+    async def extract(self, parser, streams, data=None, **kwargs):
         video = SimpleNamespace(
             get_download_url=AsyncMock(return_value=data or {"dash": {"video": []}})
         )
         with patch("bilibili_api.video.VideoDownloadURLDataDetecter") as detector:
             detector.return_value.detect_best_streams.return_value = streams
-            return await parser.extract_download_urls(video=video)
+            return await parser.extract_download_urls(video=video, **kwargs)
 
     async def test_dash_certificate_failure_uses_backup(self):
-        parser = self.parser({PRIMARY: certificate_error(), BACKUP: Response()})
+        response = Response()
+        parser = self.parser({PRIMARY: certificate_error(), BACKUP: response})
         video_url, audio_url = await self.extract(
             parser, [self.video_stream(backups=[BACKUP]), None]
         )
@@ -94,12 +95,68 @@ class BilibiliCDNTests(unittest.IsolatedAsyncioTestCase):
         for _, kwargs in parser.session.calls:
             self.assertEqual(kwargs["headers"]["Range"], "bytes=0-0")
             self.assertNotIn("ssl", kwargs)
+        response.content.read.assert_awaited_once_with(1)
 
     async def test_working_primary_does_not_request_backup(self):
-        parser = self.parser({PRIMARY: Response(status=200)})
+        response = Response(status=200)
+        parser = self.parser({PRIMARY: response})
         result = await self.extract(parser, [self.video_stream(backups=[BACKUP]), None])
         self.assertEqual(result, (PRIMARY, None))
         self.assertEqual(len(parser.session.calls), 1)
+        response.content.read.assert_awaited_once_with(1)
+
+    async def test_dash_backups_are_read_from_raw_playurl(self):
+        audio_backup = "https://backup.bilivideo.com/audio.m4s"
+        parser = self.parser(
+            {
+                PRIMARY: certificate_error(),
+                BACKUP: Response(),
+                AUDIO: certificate_error(),
+                audio_backup: Response(),
+            }
+        )
+        video = self.video_stream()
+        del video.backup_url
+        audio = Mock(
+            spec=AudioStreamDownloadURL,
+            url=AUDIO,
+            audio_quality=SimpleNamespace(name="_192K"),
+        )
+        data = {
+            "dash": {
+                "video": [{"base_url": PRIMARY, "backup_url": [BACKUP]}],
+                "audio": [{"baseUrl": AUDIO, "backupUrl": [audio_backup]}],
+            }
+        }
+        self.assertEqual(
+            await self.extract(parser, [video, audio], data), (BACKUP, audio_backup)
+        )
+
+    async def test_audio_only_does_not_probe_unavailable_video(self):
+        parser = self.parser({AUDIO: Response()})
+        audio = Mock(
+            spec=AudioStreamDownloadURL,
+            url=AUDIO,
+            backup_url=[],
+            audio_quality=SimpleNamespace(name="_192K"),
+        )
+        self.assertEqual(
+            await self.extract(parser, [self.video_stream(), audio], audio_only=True),
+            (PRIMARY, AUDIO),
+        )
+        self.assertEqual([url for url, _ in parser.session.calls], [AUDIO])
+
+    async def test_bm_route_requests_audio_only(self):
+        parser = self.parser({})
+        parser.extract_download_urls = AsyncMock(return_value=(PRIMARY, AUDIO))
+        parser.create_audio_content = Mock(return_value=Mock())
+        parser.result = Mock()
+        searched = Mock()
+        searched.group.side_effect = lambda key: "BV1ispv6pEfJ" if key == "bvid" else None
+        await parser._parse_bv_bm(searched)
+        parser.extract_download_urls.assert_awaited_once_with(
+            bvid="BV1ispv6pEfJ", page_index=0, audio_only=True
+        )
 
     async def test_audio_can_fall_back_independently(self):
         audio_backup = "https://backup.bilivideo.com/audio.m4s"
